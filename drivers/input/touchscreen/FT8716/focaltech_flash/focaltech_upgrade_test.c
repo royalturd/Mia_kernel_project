@@ -3,7 +3,7 @@
  * FocalTech fts TouchScreen driver.
  *
  * Copyright (c) 2010-2017, Focaltech Ltd. All rights reserved.
- * Copyright (C) 2019 XiaoMi, Inc.
+ * Copyright (C) 2018 XiaoMi, Inc.
  *
  * This software is licensed under the terms of the GNU General Public
  * License version 2, as published by the Free Software Foundation, and
@@ -35,7 +35,6 @@
 *****************************************************************************/
 #include "../focaltech_core.h"
 #include "../focaltech_flash.h"
-#include <linux/wakelock.h>
 #include <linux/timer.h>
 
 /*****************************************************************************
@@ -46,13 +45,11 @@
 /*****************************************************************************
 * Global variable or extern global variabls/functions
 *****************************************************************************/
-struct wake_lock ps_lock;
-
-#define FTS_DEBUG_UPGRADE(fmt, args...) do{\
-                                                printk(KERN_ERR "[FTS][UPGRADE]:##############################################################################\n");\
-                                                printk(KERN_ERR "[FTS][UPGRADE]: "fmt"\n", ##args);\
-                                                printk(KERN_ERR "[FTS][UPGRADE]:##############################################################################\n");\
-                                           }while(0)\
+#define FTS_DEBUG_UPGRADE(fmt, args...) do {\
+									printk(KERN_ERR "[FTS][UPGRADE]:##############################################################################\n");\
+									printk(KERN_ERR "[FTS][UPGRADE]: "fmt"\n", ##args);\
+									printk(KERN_ERR "[FTS][UPGRADE]:##############################################################################\n");\
+								} while (0)\
 
 /*****************************************************************************
 * Static function prototypes
@@ -67,37 +64,32 @@ struct wake_lock ps_lock;
 ***********************************************************************/
 static int fts_ctpm_auto_upgrade_pingpong(struct i2c_client *client)
 {
-    u8 uc_tp_fm_ver;
-    int i_ret = 0;
-    u8 uc_upgrade_times = 0;
+	u8 uc_tp_fm_ver;
+	int i_ret = 0;
+	u8 uc_upgrade_times = 0;
 
-    FTS_FUNC_ENTER();
+	FTS_FUNC_ENTER();
 
-    /* pingpong test mode, need upgrade */
-    FTS_INFO("[UPGRADE]: pingpong test mode, need upgrade!!");
-    do
-    {
-        uc_upgrade_times++;
+	/* pingpong test mode, need upgrade */
+	FTS_INFO("[UPGRADE]: pingpong test mode, need upgrade!!");
+	do {
+		uc_upgrade_times++;
 
-        /* fw upgrade */
-        i_ret = fts_ctpm_fw_upgrade(client);
+		/* fw upgrade */
+		i_ret = fts_ctpm_fw_upgrade(client);
 
-        if (i_ret == 0) /* upgrade success */
-        {
-            fts_i2c_read_reg(client, FTS_REG_FW_VER, &uc_tp_fm_ver);
-            FTS_DEBUG("[UPGRADE]: upgrade to new version 0x%x", uc_tp_fm_ver);
-        }
-        else /* upgrade fail */
-        {
-            /* if upgrade fail, reset to run ROM. if app in flash is ok. TP will work success */
-            FTS_INFO("[UPGRADE]: upgrade fail, reset now!!");
-            fts_ctpm_rom_or_pram_reset(client);
-        }
-    }
-    while ((i_ret != 0) && (uc_upgrade_times < 2));  /* if upgrade fail, upgrade again. then return */
+		if (i_ret == 0) /* upgrade success */ {
+			fts_i2c_read_reg(client, FTS_REG_FW_VER, &uc_tp_fm_ver);
+			FTS_DEBUG("[UPGRADE]: upgrade to new version 0x%x", uc_tp_fm_ver);
+		} else /* upgrade fail */ {
+			/* if upgrade fail, reset to run ROM. if app in flash is ok. TP will work success */
+			FTS_INFO("[UPGRADE]: upgrade fail, reset now!!");
+			fts_ctpm_rom_or_pram_reset(client);
+		}
+	} while ((i_ret != 0) && (uc_upgrade_times < 2));  /* if upgrade fail, upgrade again. then return */
 
-    FTS_FUNC_EXIT();
-    return i_ret;
+	FTS_FUNC_EXIT();
+	return i_ret;
 }
 
 /************************************************************************
@@ -110,21 +102,18 @@ static int fts_ctpm_auto_upgrade_pingpong(struct i2c_client *client)
 void fts_ctpm_display_upgrade_time(bool start_time)
 {
 #if FTS_GET_UPGRADE_TIME
-    static struct timeval tpend;
-    static struct timeval tpstart;
-    static int timeuse;
+	static struct timeval tpend;
+	static struct timeval tpstart;
+	static int timeuse;
 
-    if (start_time)
-    {
-        do_gettimeofday(&tpstart);
-    }
-    else
-    {
-        do_gettimeofday(&tpend);
-        timeuse = 1000000*(tpend.tv_sec-tpstart.tv_sec)+ tpend.tv_usec-tpstart.tv_usec;
-        timeuse/=1000000;
-        FTS_DEBUG("[UPGRADE]: upgrade success : Use time: %d Seconds!!", timeuse);
-    }
+	if (start_time) {
+		do_gettimeofday(&tpstart);
+	} else {
+		do_gettimeofday(&tpend);
+		timeuse = 1000000 * (tpend.tv_sec-tpstart.tv_sec) + tpend.tv_usec-tpstart.tv_usec;
+		timeuse /= 1000000;
+		FTS_DEBUG("[UPGRADE]: upgrade success : Use time: %d Seconds!!", timeuse);
+	}
 #endif
 }
 
@@ -137,44 +126,33 @@ void fts_ctpm_display_upgrade_time(bool start_time)
 ***********************************************************************/
 int fts_ctpm_auto_upgrade(struct i2c_client *client)
 {
-    int i_ret = 0;
-    static int uc_ErrorTimes;
-    static int uc_UpgradeTimes;
+	int i_ret = 0;
+	static int uc_ErrorTimes
+	static int uc_UpgradeTimes
 
-    wake_lock_init(&ps_lock, WAKE_LOCK_SUSPEND, "tp_wakelock");
+	/* (FTS_GET_VENDOR_ID_NUM == 0) */
+	g_fw_file = CTPM_FW;
+	g_fw_len = fts_getsize(FW_SIZE);
+	FTS_DEBUG("[UPGRADE]FW FILE:CTPM_FW, SIZE:%x", g_fw_len);
 
-    wake_lock(&ps_lock);
+	do {
+		uc_UpgradeTimes++;
 
-    /* (FTS_GET_VENDOR_ID_NUM == 0) */
-    g_fw_file = CTPM_FW;
-    g_fw_len = fts_getsize(FW_SIZE);
-    FTS_DEBUG("[UPGRADE]FW FILE:CTPM_FW, SIZE:%x", g_fw_len);
+		FTS_DEBUG_UPGRADE("start to upgrade %d times !!", uc_UpgradeTimes);
 
-    do
-    {
-        uc_UpgradeTimes++;
+		fts_ctpm_display_upgrade_time(true);
 
-        FTS_DEBUG_UPGRADE("start to upgrade %d times !!", uc_UpgradeTimes);
+		i_ret = fts_ctpm_auto_upgrade_pingpong(client);
+		if (i_ret == 0) {
+			fts_ctpm_display_upgrade_time(false);
+		} else {
+			uc_ErrorTimes++;
+		}
 
-        fts_ctpm_display_upgrade_time(true);
+		FTS_DEBUG_UPGRADE("upgrade %d times, error %d times!!", uc_UpgradeTimes, uc_ErrorTimes);
+	} while (uc_UpgradeTimes < (FTS_UPGRADE_TEST_NUMBER));
 
-        i_ret = fts_ctpm_auto_upgrade_pingpong(client);
-        if (i_ret == 0)
-        {
-            fts_ctpm_display_upgrade_time(false);
-        }
-        else
-        {
-            uc_ErrorTimes++;
-        }
-
-        FTS_DEBUG_UPGRADE("upgrade %d times, error %d times!!", uc_UpgradeTimes, uc_ErrorTimes);
-    }
-    while (uc_UpgradeTimes < (FTS_UPGRADE_TEST_NUMBER));
-
-    wake_unlock(&ps_lock);
-
-    return 0;
+	return 0;
 }
 #endif
 
