@@ -1,0 +1,229 @@
+/*
+ *  compress_core.c - compress offload core
+ *
+ *  Copyright (C) 2011 Intel Corporation
+ *  Authors:	Vinod Koul <vinod.koul@linux.intel.com>
+ *		Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+ *  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ *
+ *  This program is free software; you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation; version 2 of the License.
+ *
+ *  This program is distributed in the hope that it will be useful, but
+ *  WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ *  General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License along
+ *  with this program; if not, write to the Free Software Foundation, Inc.,
+ *  59 Temple Place, Suite 330, Boston, MA 02111-1307 USA.
+ *
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ *
+ */
+#define FORMAT(fmt) "%s: %d: " fmt, __func__, __LINE__
+#define pr_fmt(fmt) KBUILD_MODNAME ": " FORMAT(fmt)
+
+#include <linux/file.h>
+#include <linux/fs.h>
+#include <linux/list.h>
+#include <linux/math64.h>
+#include <linux/mm.h>
+#include <linux/mutex.h>
+#include <linux/poll.h>
+#include <linux/slab.h>
+#include <linux/sched.h>
+#include <linux/types.h>
+#include <linux/uio.h>
+#include <linux/uaccess.h>
+#include <linux/module.h>
+#include <sound/core.h>
+#include <sound/initval.h>
+#include <sound/compress_params.h>
+#include <sound/compress_offload.h>
+#include <sound/compress_driver.h>
+
+/* struct snd_compr_codec_caps overflows the ioctl bit size for some
+ * architectures, so we need to disable the relevant ioctls.
+ */
+#if _IOC_SIZEBITS < 14
+#define COMPR_CODEC_CAPS_OVERFLOW
+#endif
+
+/* TODO:
+ * - add substream support for multiple devices in case of
+ *	SND_DYNAMIC_MINORS is not used
+ * - Multiple node representation
+ *	driver should be able to register multiple nodes
+ */
+
+static DEFINE_MUTEX(device_mutex);
+
+struct snd_compr_file {
+	unsigned long caps;
+	struct snd_compr_stream stream;
+};
+
+/*
+ * a note on stream states used:
+ * we use follwing states in the compressed core
+ * SNDRV_PCM_STATE_OPEN: When stream has been opened.
+ * SNDRV_PCM_STATE_SETUP: When stream has been initialized. This is done by
+ *	calling SNDRV_COMPRESS_SET_PARAMS. running streams will come to this
+ *	state at stop by calling SNDRV_COMPRESS_STOP, or at end of drain.
+ * SNDRV_PCM_STATE_RUNNING: When stream has been started and is
+ *	decoding/encoding and rendering/capturing data.
+ * SNDRV_PCM_STATE_DRAINING: When stream is draining current data. This is done
+ *	by calling SNDRV_COMPRESS_DRAIN.
+ * SNDRV_PCM_STATE_PAUSED: When stream is paused. This is done by calling
+ *	SNDRV_COMPRESS_PAUSE. It can be stopped or resumed by calling
+ *	SNDRV_COMPRESS_STOP or SNDRV_COMPRESS_RESUME respectively.
+ */
+static int snd_compr_open(struct inode *inode, struct file *f)
+{
+	struct snd_compr *compr;
+	struct snd_compr_file *data;
+	struct snd_compr_runtime *runtime;
+	enum snd_compr_direction dirn;
+	int maj = imajor(inode);
+	int ret;
+
+	if ((f->f_flags & O_ACCMODE) == O_WRONLY)
+		dirn = SND_COMPRESS_PLAYBACK;
+	else if ((f->f_flags & O_ACCMODE) == O_RDONLY)
+		dirn = SND_COMPRESS_CAPTURE;
+	else
+		return -EINVAL;
+
+	if (maj == snd_major)
+		compr = snd_lookup_minor_data(iminor(inode),
+					SNDRV_DEVICE_TYPE_COMPRESS);
+	else
+		return -EBADFD;
+
+	if (compr == NULL) {
+		pr_err("no device data!!!\n");
+		return -ENODEV;
+	}
+
+	if (dirn != compr->direction) {
+		pr_err("this device doesn't support this direction\n");
+		snd_card_unref(compr->card);
+		return -EINVAL;
+	}
+
+	data = kzalloc(sizeof(*data), GFP_KERNEL);
+	if (!data) {
+		snd_card_unref(compr->card);
+		return -ENOMEM;
+	}
+	data->stream.ops = compr->ops;
+	data->stream.direction = dirn;
+	data->stream.private_data = compr->private_data;
+	data->stream.device = compr;
+	runtime = kzalloc(sizeof(*runtime), GFP_KERNEL);
+	if (!runtime) {
+		kfree(data);
+		snd_card_unref(compr->card);
+		return -ENOMEM;
+	}
+	runtime->state = SNDRV_PCM_STATE_OPEN;
+	init_waitqueue_head(&runtime->sleep);
+	data->stream.runtime = runtime;
+	f->private_data = (void *)data;
+	mutex_lock(&compr->lock);
+	ret = compr->ops->open(&data->stream);
+	mutex_unlock(&compr->lock);
+	if (ret) {
+		kfree(runtime);
+		kfree(data);
+	}
+	snd_card_unref(compr->card);
+	return ret;
+}
+
+static int snd_compr_free(struct inode *inode, struct file *f)
+{
+	struct snd_compr_file *data = f->private_data;
+	struct snd_compr_runtime *runtime = data->stream.runtime;
+
+	switch (runtime->state) {
+	case SNDRV_PCM_STATE_RUNNING:
+	case SNDRV_PCM_STATE_DRAINING:
+	case SNDRV_PCM_STATE_PAUSED:
+		data->stream.ops->trigger(&data->stream, SNDRV_PCM_TRIGGER_STOP);
+		break;
+	default:
+		break;
+	}
+
+	data->stream.ops->free(&data->stream);
+	kfree(data->stream.runtime->buffer);
+	kfree(data->stream.runtime);
+	kfree(data);
+	return 0;
+}
+
+static int snd_compr_update_tstamp(struct snd_compr_stream *stream,
+		struct snd_compr_tstamp *tstamp)
+{
+	int err = 0;
+	if (!stream->ops->pointer)
+		return -ENOTSUPP;
+	err = stream->ops->pointer(stream, tstamp);
+	if (err)
+		return err;
+	pr_debug("dsp consumed till %d total %llu bytes\n",
+		tstamp->byte_offset, tstamp->copied_total);
+	if (stream->direction == SND_COMPRESS_PLAYBACK)
+		stream->runtime->total_bytes_transferred = tstamp->copied_total;
+	else
+		stream->runtime->total_bytes_available = tstamp->copied_total;
+	return 0;
+}
+
+static size_t snd_compr_calc_avail(struct snd_compr_stream *stream,
+		struct snd_compr_avail *avail)
+{
+	memset(avail, 0, sizeof(*avail));
+	snd_compr_update_tstamp(stream, &avail->tstamp);
+	/* Still need to return avail even if tstamp can't be filled in */
+
+	if (stream->runtime->total_bytes_available == 0 &&
+			stream->runtime->state == SNDRV_PCM_STATE_SETUP &&
+			stream->direction == SND_COMPRESS_PLAYBACK) {
+		pr_debug("detected init and someone forgot to do a write\n");
+		return stream->runtime->buffer_size;
+	}
+	pr_debug("app wrote %lld, DSP consumed %lld\n",
+			stream->runtime->total_bytes_available,
+			stream->runtime->total_bytes_transferred);
+	if (stream->runtime->total_bytes_available ==
+				stream->runtime->total_bytes_transferred) {
+		if (stream->direction == SND_COMPRESS_PLAYBACK) {
+			pr_debug("both pointers are same, returning full avail\n");
+			return stream->runtime->buffer_size;
+		} else {
+			pr_debug("both pointers are same, returning no avail\n");
+			return 0;
+		}
+	}
+
+	avail->avail = stream->runtime->total_bytes_available -
+			stream->runtime->total_bytes_transferred;
+	if (stream->direction == SND_COMPRESS_PLAYBACK)
+		avail->avail = stream->runtime->buffer_size - avail->avail;
+
+	pr_debug("ret avail as %lld\n", avail->avail);
+	return avail->avail;
+}
+
+static inline size_t snd_compr_get_avail(struct snd_compr_stream *stream)
+{
+	struct snd_compr_avail avail;
+
+	return snd_compr_calc_avail(stream, &avail);
+}
+
+static int
